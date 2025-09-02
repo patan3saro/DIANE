@@ -4,8 +4,8 @@ This repository provides the full codebase for **dynamic inference adaptation**,
 
 ## Getting Started
 Clone the repository and install the required dependencies:
-git clone https://github.com/<your-username>/dynamic-inference-adaptation.git  
-cd dynamic-inference-adaptation  
+git clone https://github.com/patan3saro/DynamicInferenceAdaptationNN.git  
+cd DynamicInferenceAdaptationNN  
 pip install -r requirements.txt  
 
 Run the full pipeline:
@@ -25,10 +25,9 @@ If you use this repository for academic reference, please cite:
   title  = {Dynamic Inference Adaptation},  
   author = {Rosario Patanè},  
   year   = {2025},  
-  url    = {https://github.com/<your-username>/dynamic-inference-adaptation}  
+  url    = {https://github.com/patan3saro/DynamicInferenceAdaptationNN}  
 }
 
 ## License
 © 2025 Rosario Patanè. All rights reserved.  
 This code is provided for research and personal use only. **Redistribution, modification, or commercial use is not allowed without explicit permission from the author.**
-
