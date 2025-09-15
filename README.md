@@ -1,5 +1,7 @@
 # Dynamic Inference Adaptation
 
+Dynamic Inference Adaptation with Neural Elasticity (DIANE)
+
 This repository provides the full codebase for **dynamic inference adaptation**, with the complete **NeuroTTA pipeline**. It investigates how neural networks can adapt their behavior **at inference time** under changing data distributions. The code includes training on CIFAR-10 (baseline models), Test-Time Adaptation (TTA) with dynamic neuron routing, calibration with T* for robust predictions, ablation studies to evaluate each component, and a single-cell Colab pipeline for fast reproduction.
 
 ## Getting Started
