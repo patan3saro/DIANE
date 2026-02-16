@@ -475,6 +475,8 @@ class NPTTAConfig:
     sprt_sigma: float = 0.03
     prox_w: float = 0.05
     prox_w_id: float = 0.10   # prox verso identità/source per proteggere clean
+    gauss_entropy_scale: float = 0.85  # scale entropy_thresh for gauss/non-blur gating (lower=adapt more)
+    rotta_mem_conf_min: float = 0.0    # min teacher confidence to add sample to memory (0=no filter)
 
 
 def build_cfg_from_args(args: argparse.Namespace, cfg_overrides: Optional[dict] = None) -> NPTTAConfig:
@@ -522,6 +524,8 @@ def build_cfg_from_args(args: argparse.Namespace, cfg_overrides: Optional[dict] 
         sprt_sigma=args.sprt_sigma,
         prox_w=args.prox_w,
         prox_w_id=args.prox_w_id,
+        gauss_entropy_scale=ov.get("gauss_entropy_scale", args.gauss_entropy_scale),
+        rotta_mem_conf_min=ov.get("rotta_mem_conf_min", args.rotta_mem_conf_min),
     )
 
 # ============ Training ============
@@ -749,6 +753,9 @@ def eval_stream_nptta(model: ResNet18WithAdapter, source_model: ResNet18WithAdap
                     # FIX: step_time once per batch here, then never inside add()
                     rotta_mem.step_time()
                     for bi in range(x.size(0)):
+                        # throttle: skip low-confidence samples to keep memory clean
+                        if cfg.rotta_mem_conf_min > 0.0 and float(conf[bi].item()) < cfg.rotta_mem_conf_min:
+                            continue
                         rotta_mem.add(
                             x_cpu_chw=x[bi].detach().cpu(),
                             y=int(y_hat[bi].item()),
@@ -813,7 +820,8 @@ def eval_stream_nptta(model: ResNet18WithAdapter, source_model: ResNet18WithAdap
                 else:
                     do_adapt = do_adapt_heur
             else:
-                do_adapt = (ent_m > cfg.entropy_thresh) or (dis_m > dis_thr_dyn)
+                gauss_ent_thr = cfg.entropy_thresh * cfg.gauss_entropy_scale
+                do_adapt = (ent_m > gauss_ent_thr) or (dis_m > dis_thr_dyn)
 
             if kind == "clean":
                 do_adapt = False
@@ -829,6 +837,7 @@ def eval_stream_nptta(model: ResNet18WithAdapter, source_model: ResNet18WithAdap
 
                 # update usa loss KL(teacher || student) su batch campionato dal memory
                 model.train()
+                _rotta_anchor = copy.deepcopy(model.adapter.state_dict())  # rollback anchor
                 for _rs in range(cfg.rotta_steps):
                     xm, ym, ages, uncs = rotta_mem.sample(cfg.rotta_batch_size, device)
 
@@ -841,15 +850,22 @@ def eval_stream_nptta(model: ResNet18WithAdapter, source_model: ResNet18WithAdap
                         # teacher target (single-view, veloce)
                         pt = F.softmax(teacher(xm), dim=1).detach()
                         ls = model(strong_aug(xm))  # strong aug SOLO sullo student (RoTTA core)
-
                         ps = F.softmax(ls, dim=1)
-
                         eps = 1e-6
                         log_pt = (pt.clamp_min(eps)).log()
                         log_ps = (ps.clamp_min(eps)).log()
                         kld = (pt * (log_pt - log_ps)).sum(dim=1)   # (B,)
                         loss_rotta = (w * kld).mean()
+
+                    if total_batches % DEBUG_MEM_EVERY == 0:
                         print(f"[SANITY][RoTTA loss] {float(loss_rotta.detach().item()):.4f}")
+
+                    # safety: NaN/Inf or loss explosion → rollback and skip step
+                    if not torch.isfinite(loss_rotta) or loss_rotta.item() > LOSS_HARD_CAP:
+                        model.adapter.load_state_dict(_rotta_anchor, strict=True)
+                        opt.zero_grad(set_to_none=True)
+                        scaler.update()  # reset scaler state
+                        continue
 
                     scaler.scale(loss_rotta).backward()
                     scaler.unscale_(opt)
@@ -1230,6 +1246,8 @@ def sweep(args) -> None:
         "blur_phys_w": [0.0, 0.25, 0.5, 1.0],
         "blur_disable_phys_when_distill": [True, False],
         "blur_entropy_scale": [0.5, 0.7, 0.85, 1.0],
+        "gauss_entropy_scale": [0.6, 0.75, 0.85, 1.0],
+        "rotta_mem_conf_min": [0.0, 0.5, 0.6, 0.7],
     }
     rng, rows = random.Random(args.sweep_seed), []
     for i in range(args.sweep_trials):
@@ -1336,6 +1354,10 @@ def parse_args() -> argparse.Namespace:
     # regularization
     ap.add_argument("--prox_w", type=float, default=0.05)
     ap.add_argument("--prox_w_id", type=float, default=0.10)
+    ap.add_argument("--gauss_entropy_scale", type=float, default=0.85,
+                    help="Scale entropy_thresh for gauss/non-blur gating (lower=adapt more, default 0.85)")
+    ap.add_argument("--rotta_mem_conf_min", type=float, default=0.0,
+                    help="Min teacher confidence to add sample to RoTTA memory (0=no filter, default 0)")
     # RoTTA core
     ap.add_argument("--rotta_enable", action="store_true")
     ap.add_argument("--rotta_memory_size", type=int, default=64)
