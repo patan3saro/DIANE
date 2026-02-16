@@ -475,6 +475,7 @@ class NPTTAConfig:
     sprt_sigma: float = 0.03
     prox_w: float = 0.05
     prox_w_id: float = 0.10   # prox verso identità/source per proteggere clean
+    adapt_teacher_momentum: float = 0.995  # faster teacher EMA during adaptation (vs teacher_momentum for non-adapt)
     gauss_entropy_scale: float = 0.85  # scale entropy_thresh for gauss/non-blur gating (lower=adapt more)
     rotta_mem_conf_min: float = 0.0    # min teacher confidence to add sample to memory (0=no filter)
 
@@ -524,6 +525,7 @@ def build_cfg_from_args(args: argparse.Namespace, cfg_overrides: Optional[dict] 
         sprt_sigma=args.sprt_sigma,
         prox_w=args.prox_w,
         prox_w_id=args.prox_w_id,
+        adapt_teacher_momentum=ov.get("adapt_teacher_momentum", args.adapt_teacher_momentum),
         gauss_entropy_scale=ov.get("gauss_entropy_scale", args.gauss_entropy_scale),
         rotta_mem_conf_min=ov.get("rotta_mem_conf_min", args.rotta_mem_conf_min),
     )
@@ -1141,13 +1143,15 @@ def eval_stream_nptta(model: ResNet18WithAdapter, source_model: ResNet18WithAdap
             restore_prob = cfg.restore_prob_when_shift if do_adapt else cfg.restore_prob_when_clean
             stochastic_restore_backbone(model, source_model, prob=restore_prob)
 
-            # Update teacher solo se sample affidabile per evitare error propagation
-            if (kind != "blur") or cfg.blur_update_teacher:
-                # Usa momentum più alto (slower update) quando incertezza è alta
-                mom = cfg.teacher_momentum
-                if dis_m > cfg.disagree_thresh * 1.5:
-                    mom = 0.9998  # quasi nessun update
-                ema_update(teacher, model, momentum=mom)
+            # Update teacher EMA — always, including blur.
+            # Separate teacher_blur object prevents cross-segment contamination
+            # (restored to teacher_main at segment boundary).
+            # Use faster momentum when adaptation actually fired (student moved).
+            did_adapt_this_batch = do_adapt and confident
+            mom = cfg.adapt_teacher_momentum if did_adapt_this_batch else cfg.teacher_momentum
+            if dis_m > cfg.disagree_thresh * 1.5:
+                mom = min(0.9998, mom + (1.0 - mom) * 0.5)  # slower when uncertain
+            ema_update(teacher, model, momentum=mom)
 
             # CoTTA-style: predict with EMA teacher (more stable than hot-updated student)
             # usa teacher per eval (stabile); student serve per update
@@ -1246,6 +1250,7 @@ def sweep(args) -> None:
         "blur_phys_w": [0.0, 0.25, 0.5, 1.0],
         "blur_disable_phys_when_distill": [True, False],
         "blur_entropy_scale": [0.5, 0.7, 0.85, 1.0],
+        "adapt_teacher_momentum": [0.99, 0.995, 0.998, 0.999],
         "gauss_entropy_scale": [0.6, 0.75, 0.85, 1.0],
         "rotta_mem_conf_min": [0.0, 0.5, 0.6, 0.7],
     }
@@ -1354,6 +1359,8 @@ def parse_args() -> argparse.Namespace:
     # regularization
     ap.add_argument("--prox_w", type=float, default=0.05)
     ap.add_argument("--prox_w_id", type=float, default=0.10)
+    ap.add_argument("--adapt_teacher_momentum", type=float, default=0.995,
+                    help="Faster teacher EMA momentum used when adaptation fires (default 0.995)")
     ap.add_argument("--gauss_entropy_scale", type=float, default=0.85,
                     help="Scale entropy_thresh for gauss/non-blur gating (lower=adapt more, default 0.85)")
     ap.add_argument("--rotta_mem_conf_min", type=float, default=0.0,
