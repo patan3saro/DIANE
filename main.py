@@ -466,6 +466,7 @@ class NPTTAConfig:
     blur_bn_bank: bool = True
     blur_phys_w: float = 1.0
     blur_disable_phys_when_distill: bool = True
+    blur_entropy_scale: float = 0.7  # lower entropy threshold for blur gating (more adaptation)
     use_sprt_for_blur: bool = True
     sprt_alpha: float = 0.05
     sprt_beta: float = 0.10
@@ -512,6 +513,7 @@ def build_cfg_from_args(args: argparse.Namespace, cfg_overrides: Optional[dict] 
         blur_bn_bank=ov.get("blur_bn_bank", (not args.no_blur_bn_bank)),
         blur_phys_w=ov.get("blur_phys_w", args.blur_phys_w),
         blur_disable_phys_when_distill=ov.get("blur_disable_phys_when_distill", (not args.blur_keep_phys_with_distill)),
+        blur_entropy_scale=ov.get("blur_entropy_scale", args.blur_entropy_scale),
         use_sprt_for_blur=args.use_sprt_for_blur,
         sprt_alpha=args.sprt_alpha,
         sprt_beta=args.sprt_beta,
@@ -744,6 +746,7 @@ def eval_stream_nptta(model: ResNet18WithAdapter, source_model: ResNet18WithAdap
 
 
                     # store sample-by-sample (CPU) per memory
+                    # FIX: step_time once per batch here, then never inside add()
                     rotta_mem.step_time()
                     for bi in range(x.size(0)):
                         rotta_mem.add(
@@ -753,7 +756,7 @@ def eval_stream_nptta(model: ResNet18WithAdapter, source_model: ResNet18WithAdap
                             alpha=cfg.rotta_alpha,
                             lambda_t=cfg.rotta_lambda_t,
                             lambda_u=cfg.rotta_lambda_u,
-                            step_time=(bi == 0),
+                            step_time=False,  # FIX: already stepped above, don't double-count
                         )
                     # 3) PATCH: limita lo spam di log memoria (stesso blocco)
                     # sostituisci:
@@ -793,16 +796,20 @@ def eval_stream_nptta(model: ResNet18WithAdapter, source_model: ResNet18WithAdap
                 s = float((ent.mean() / math.log(p_t_gate.size(1))).item())
 
                 sig2, mu0, mu1 = max(1e-12, float(cfg.sprt_sigma) ** 2), float(cfg.sprt_mu0), float(cfg.sprt_mu1)
-                llr_inc = ((-(s - mu1) ** 2) + (-(s - mu0) ** 2)) / (2.0 * sig2)
+                # FIX: correct SPRT LLR for Gaussian: log(L1/L0) = [-(s-mu1)^2 + (s-mu0)^2] / (2*sig2)
+                llr_inc = (-(s - mu1) ** 2 + (s - mu0) ** 2) / (2.0 * sig2)
                 llr_blur += llr_inc
                 sprt_state = "shift" if llr_blur >= A else ("no_shift" if llr_blur <= B else "unknown")
+                if total_batches % DEBUG_MEM_EVERY == 0:
+                    print(f"[SANITY][SPRT] llr={llr_blur:.4f} A={A:.4f} B={B:.4f} state={sprt_state} s={s:.4f}")
 
             # Decide adaptation
             if kind == "blur":
-                do_adapt_heur = (ent_m > cfg.entropy_thresh) or (dis_m > dis_thr_dyn * 0.5)
+                blur_ent_thr = cfg.entropy_thresh * cfg.blur_entropy_scale
+                do_adapt_heur = (ent_m > blur_ent_thr) or (dis_m > dis_thr_dyn * 0.5)
                 # fallback: se entropia è davvero alta, adatta anche se SPRT dice no_shift
                 if cfg.use_sprt_for_blur:
-                    do_adapt = do_adapt_heur and ((sprt_state != "no_shift") or (ent_m > cfg.entropy_thresh * 2.0))
+                    do_adapt = do_adapt_heur and ((sprt_state != "no_shift") or (ent_m > blur_ent_thr * 2.0))
                 else:
                     do_adapt = do_adapt_heur
             else:
@@ -1222,6 +1229,7 @@ def sweep(args) -> None:
         "blur_bn_bank": [True, False],
         "blur_phys_w": [0.0, 0.25, 0.5, 1.0],
         "blur_disable_phys_when_distill": [True, False],
+        "blur_entropy_scale": [0.5, 0.7, 0.85, 1.0],
     }
     rng, rows = random.Random(args.sweep_seed), []
     for i in range(args.sweep_trials):
@@ -1314,6 +1322,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--no_blur_bn_bank", action="store_true")
     ap.add_argument("--blur_phys_w", type=float, default=0.25)
     ap.add_argument("--blur_keep_phys_with_distill", action="store_true")
+    ap.add_argument("--blur_entropy_scale", type=float, default=0.7,
+                    help="Scale entropy_thresh for blur gating (lower=adapt more, default 0.7)")
 
     # SPRT
     ap.add_argument("--use_sprt_for_blur", action="store_true")
